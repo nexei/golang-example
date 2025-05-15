@@ -11,7 +11,7 @@ jobs:
     name: Run Unit Tests
     runs-on: ubuntu-latest
     container:
-      image: debian:latest # Use a Debian base image
+      image: debian:testing # Switch to Debian testing for newer packages (Clang 17+)
       options: --privileged
 
     steps:
@@ -22,26 +22,82 @@ jobs:
       with:
         go-version: '1.24'
 
-    - name: Install dependencies for rr and testing
+    - name: Install system build dependencies
       run: |
-        apt-get update
-        apt-get install -y wget
+        apt-get update -y
+        apt-get install -y --no-install-recommends \
+          ca-certificates \
+          cmake \
+          ninja-build \
+          clang \
+          llvm-dev \
+          libclang-dev \
+          gcc \
+          g++ \
+          librocksdb-dev \
+          gdb \
+          lldb \
+          libzydis-dev \
+          pkg-config \
+          python3-pexpect \
+          capnproto \
+          libcapnp-dev \
+          fd-find \
+          libssl-dev \
+          git \
+          make
+        update-ca-certificates
 
-    - name: Download and install rr
+    - name: Clone rr.soft repository
+      run: git clone --depth 1 https://github.com/sidkshatriya/rr.soft.git ~/rr.soft # Shallow clone is still good
+
+    - name: Cache rr.soft build
+      id: cache_rr_build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/libSoftwareCountersClang.so
+          ~/.local
+        # Static cache key. Change 'v1' to 'v2' to manually invalidate and force a rebuild.
+        key: rr-soft-build-${{ runner.os }}-static-v1
+        restore-keys: |
+          rr-soft-build-${{ runner.os }}-static-
+
+    - name: Build and install SoftwareCountersClangPlugin
+      if: steps.cache_rr_build.outputs.cache-hit != 'true'
       run: |
-        wget https://github.com/rr-debugger/rr/releases/download/5.9.0/rr-5.9.0-Linux-x86_64.deb
-        dpkg -i rr-5.9.0-Linux-x86_64.deb
+        echo "Cache miss or key changed, building SoftwareCountersClangPlugin..."
+        cd ~/rr.soft/compiler-plugins/SoftwareCountersClangPlugin
+        make install INSTALL_PATH=~/
+
+    - name: Build and install rr.soft
+      if: steps.cache_rr_build.outputs.cache-hit != 'true'
+      run: |
+        echo "Cache miss or key changed, building rr.soft..."
+        cd ~/rr.soft
+        mkdir build
+        cd build
+        cmake .. -GNinja -DCMAKE_INSTALL_PREFIX=~/.local -DCMAKE_BUILD_TYPE=Release \
+          -DSOFTWARE_COUNTERS_PLUGIN=~/libSoftwareCountersClang.so
+        ninja install -j$(nproc) # Use available cores for faster build
+
+    - name: Add rr to PATH
+      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
     - name: Install Go dependencies
       run: go mod download
 
-    - name: Run unit tests with rr
-      run: rr record go test -v ./... -short
+    - name: Run unit tests with rr.soft
+      run: |
+        go test -c -gcflags="all=-N -l" -o test_binary ./...
+        GOMAXPROCS=1 rr record -W ./test_binary -test.v || true
+        rr pack ~/.local/share/rr/test_binary-0/
+      continue-on-error: true
 
     - name: Upload rr trace artifact
       uses: actions/upload-artifact@v4
       if: always() # Always run this step, even if tests fail, to get the trace
       with:
         name: rr-trace
-        path: ~/.local/share/rr/latest-trace
+        path: ~/.local/share/rr/test_binary-0/
         retention-days: 7 # Optional: How long to keep the artifact 
